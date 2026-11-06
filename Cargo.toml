@@ -1,0 +1,16 @@
+[package]
+name = "omacraft-ui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "Shared OmaCraft suite chrome: fonts, type scale, appearance toggle and command palette."
+publish = false
+include = ["src/**", "assets/fonts/**", "Cargo.toml", "README.md", "LICENSE*"]
+
+[dependencies]
+# Each app's [patch.crates-io] decides which egui this resolves to (storytold fork or crates.io).
+egui = { version = "0.37", default-features = false }
+
+[dev-dependencies]
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
