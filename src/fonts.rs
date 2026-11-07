@@ -147,13 +147,20 @@ impl Lookup for NoLookup {
 
 impl SystemFaces {
     /// Detect the platform's faces. Blocking; each subprocess is bounded to one second.
+    ///
+    /// Apps poll this every few seconds, so a file whose size and modification time are unchanged
+    /// is not read again: its bytes are shared from the previous call.
     pub fn detect() -> Self {
         let (ui, mono) = platform::candidates();
-        Self::resolve(&*platform::lookup(), &ui, &mono, &load_file)
+        Self::resolve_shared(&*platform::lookup(), &ui, &mono, &load_cached)
     }
 
     /// The resolver itself, with the lookup and file reader injected for tests.
     pub fn resolve(lookup: &dyn Lookup, ui: &[Candidate], mono: &[Candidate], load: &dyn Fn(&Path) -> Option<Vec<u8>>) -> Self {
+        Self::resolve_shared(lookup, ui, mono, &|path| load(path).map(Arc::new))
+    }
+
+    fn resolve_shared(lookup: &dyn Lookup, ui: &[Candidate], mono: &[Candidate], load: &dyn Fn(&Path) -> Option<Arc<Vec<u8>>>) -> Self {
         let mut out = Self::default();
         for candidate in ui {
             if let Some(face) = resolve_one(lookup, candidate, false, load)
@@ -173,7 +180,7 @@ impl SystemFaces {
     }
 }
 
-fn resolve_one(lookup: &dyn Lookup, candidate: &Candidate, bold: bool, load: &dyn Fn(&Path) -> Option<Vec<u8>>) -> Option<SystemFace> {
+fn resolve_one(lookup: &dyn Lookup, candidate: &Candidate, bold: bool, load: &dyn Fn(&Path) -> Option<Arc<Vec<u8>>>) -> Option<SystemFace> {
     let (family, path, index) = match candidate {
         Candidate::Family(want) => {
             let m = lookup.find(want, bold)?;
@@ -193,7 +200,28 @@ fn resolve_one(lookup: &dyn Lookup, candidate: &Candidate, bold: bool, load: &dy
         }
     };
     let data = load(&path)?;
-    Some(SystemFace { family, path, index, data: Arc::new(data) })
+    Some(SystemFace { family, path, index, data })
+}
+
+/// `load_file` with a process-wide cache keyed by path, size and modification time.
+fn load_cached(path: &Path) -> Option<Arc<Vec<u8>>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Entry = (u64, Option<std::time::SystemTime>, Arc<Vec<u8>>);
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Entry>>> = OnceLock::new();
+    let meta = std::fs::metadata(path).ok()?;
+    let key = (meta.len(), meta.modified().ok());
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((len, modified, data)) = cache.lock().ok()?.get(path)
+        && (*len, *modified) == key
+    {
+        return Some(data.clone());
+    }
+    let data = Arc::new(load_file(path)?);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(path.to_path_buf(), (key.0, key.1, data.clone()));
+    }
+    Some(data)
 }
 
 fn load_file(path: &Path) -> Option<Vec<u8>> {
@@ -447,6 +475,21 @@ mod tests {
     fn mono_alias_takes_the_users_choice() {
         let faces = nuc_faces();
         assert_eq!(faces.mono.unwrap().family, "JetBrainsMono Nerd Font");
+    }
+
+    #[test]
+    fn unchanged_files_are_shared_not_reread() {
+        let dir = std::env::temp_dir().join(format!("omacraft-ui-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("face.ttf");
+        std::fs::write(&path, b"one").unwrap();
+        let a = load_cached(&path).unwrap();
+        let b = load_cached(&path).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        std::fs::write(&path, b"longer").unwrap();
+        let c = load_cached(&path).unwrap();
+        assert_eq!(c.as_slice(), b"longer");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
